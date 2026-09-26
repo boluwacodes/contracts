@@ -176,11 +176,15 @@ impl DataStore {
 
     pub fn get_u128(env: Env, key: BytesN<32>) -> u128 {
         let dk = DataKey::U128(key);
-        let val: u128 = env.storage().persistent().get(&dk).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
-        val
+        let val: Option<u128> = env.storage().persistent().get(&dk);
+        // extend_ttl on a missing entry traps with Storage/MissingValue, so
+        // only bump entries that exist; unset keys read as 0 (issue #587).
+        if val.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        }
+        val.unwrap_or(0)
     }
 
     /// Read multiple u128 values in one call to reduce cross-contract call overhead.
@@ -686,21 +690,21 @@ impl DataStore {
 
         let count_key = gmx_keys::keeper_execution_count_key(&env, &keeper);
         let current_count = Self::get_u128(env.clone(), count_key.clone());
-        Self::set_u128(env.clone(), caller.clone(), count_key, current_count + 1);
+        write_u128(&env, count_key, current_count + 1);
 
         let variance = executed_price.abs_diff(expected_price);
 
         if let Some(variance_bps) = (variance * 10000).checked_div(expected_price) {
             let total_var_key = gmx_keys::keeper_total_variance_key(&env, &keeper);
             let current_total_var = Self::get_u128(env.clone(), total_var_key.clone());
-            Self::set_u128(env.clone(), caller.clone(), total_var_key, current_total_var + variance_bps);
+            write_u128(&env, total_var_key, current_total_var + variance_bps);
 
             // Slash penalty for execution variance exceeding 500 bps (5%)
             if variance_bps > 500 {
                 let slash_key = gmx_keys::keeper_slash_amount_key(&env, &keeper);
                 let current_slash = Self::get_u128(env.clone(), slash_key.clone());
                 let penalty = 100u128;
-                Self::set_u128(env.clone(), caller.clone(), slash_key, current_slash + penalty);
+                write_u128(&env, slash_key, current_slash + penalty);
 
                 env.events().publish_event(&KeeperSlashed {
                     keeper,
@@ -917,6 +921,18 @@ fn paginate_b32(env: &Env, vec: &Vec<BytesN<32>>, start: u32, end: u32) -> Vec<B
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+/// Persist a u128 without re-running auth. For entrypoints that have already
+/// done `caller.require_auth()` + `require_controller` themselves: calling the
+/// public `set_u128` from there requires the same auth twice in one frame,
+/// which the host rejects with Auth/ExistingValue (issue #587).
+fn write_u128(env: &Env, key: BytesN<32>, value: u128) {
+    let dk = DataKey::U128(key);
+    env.storage().persistent().set(&dk, &value);
+    env.storage()
+        .persistent()
+        .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+}
 
 #[cfg(test)]
 mod tests {
